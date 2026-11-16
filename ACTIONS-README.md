@@ -425,7 +425,7 @@ schedule:
 | 本机调度器时间窗 | `node scripts/ci/ensure-daily-run.mjs --dry` | `[rewards-daily] 现在北京 0 点，早于 6 点，等下一个窗口` |
 | Gitee 调度器时间窗 | 构建 #3（00:50:24，commit 32fce28） | 日志含 `[rewards-daily] 现在北京 0 点，早于 6 点，等下一个窗口` + `[kgcheckin-签到] 现在北京 0 点，早于 1 点，等下一个窗口` + `=== run end ===` + `=== exit=0 ===`，构建 success |
 | done key 命中 | 临时脚本调 `doneKeyExists` | rewards → `null`（标记已删）；kg → `HIT kg-done-2026-11-17 @ 2026-11-16T16:26:11Z` |
-| Gitee 构建 #4 | 01:0x，commit 91fc909 | runner 横幅升 `v4-donekey` |
+| Gitee runner 横幅 | `gitee-run.sh` 已升 `v4-donekey`（commit 91fc909） | 下次 Gitee 构建日志会打印这一行 |
 
 ### 需要知道的一个取舍
 
