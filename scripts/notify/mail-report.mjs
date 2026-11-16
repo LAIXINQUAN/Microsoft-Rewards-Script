@@ -26,7 +26,7 @@ import { DatabaseSync } from 'node:sqlite';
 const TARGET = { name: '中国石化礼品卡 500 元', points: 96530 };
 const MAIL_FROM = process.env.MAIL_FROM || 'laixinqb@foxmail.com';
 const MAIL_AUTH = process.env.MAIL_AUTH || '';
-const MAIL_TO = (process.env.MAIL_TO || '3766308071@qq.com,525177186@qq.com').split(',').map(s => s.trim()).filter(Boolean);
+const MAIL_TO = (process.env.MAIL_TO || '3766308071@qq.com').split(',').map(s => s.trim()).filter(Boolean);
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.qq.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const RUN_STATUS = process.env.RUN_STATUS || 'unknown';
