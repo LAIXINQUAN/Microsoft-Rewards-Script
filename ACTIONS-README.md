@@ -48,3 +48,24 @@ gh run watch
 - 私有仓库 Actions 每月 2000 分钟免费额度，每天一次约 45 分钟，够用（约 1350 分钟/月）
 - 公开仓库无限额度
 - 定时任务在仓库 60 天无提交后会被 GitHub 自动暂停，需要手动启用或加保活提交
+
+---
+
+## 实测记录（2026-11-16）
+
+- 账号：3766308071@qq.com（CN / zh-CN）
+- 登录：本机 Chrome 可见窗口手动登录 → CDP 抓 cookie → 生成 sessions.db（desktop + mobile 两行，同一份 cookie）
+- 本地验证：`node dist/index.js` 跑通，积分 10159 → 10424（+265），连续保护已启用、剩余 10 天
+- Actions 首次运行：workflow 步骤 1-10 全部通过；会话注入、config 注入、.env 注入、npm ci、Chromium 安装、编译均成功
+
+## 已知限制（实测）
+
+1. `GET_REWARD-SESSION` 走的是 API/bootstrap 模式，主接口 `Dashboard data missing from API response` 时会 fallback 到 Bing flyout，日志里有 WARN 但不影响拿分
+2. App 推广类任务（Sapphire_AppNewBonus_*）多数返回 0 分，属账号/地区限制，不是脚本问题
+3. `ZHstar_Rewards_DailyGlobalOffer_Evergreen_VerB_Locked_level2` 期望 100 实际 0，同上
+
+## 排障
+
+- Actions 报 `既没有缓存也没有 SESSIONS_DB_B64`：重新本地登录导出 sessions.db 更新 Secret
+- Actions 报 `Login failed`：cookie 过期，本地重登
+- 想改搜索条数：改 config.json → 更新 `CONFIG_JSON` Secret
