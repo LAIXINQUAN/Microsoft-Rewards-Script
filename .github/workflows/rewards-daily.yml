@@ -43,6 +43,23 @@ jobs:
         id: d
         run: echo "day=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
 
+      # 微软每日任务在中国区并不是北京 00:00 重置：实测 23:19 起的一次能拿满 +313，
+      # 而 00:10 跑同一套只剩 +33（桌面搜索配额还显示 60/60 已完成）。
+      # 所以北京 06:00 之前一律不执行 —— 否则会把「今日已完成」标记写错，
+      # 白天真正的几个 cron 全被跳过，当天积分就白丢了。
+      - name: 判断执行时间窗
+        id: win
+        run: |
+          set -e
+          H=$(TZ=Asia/Shanghai date +%H | sed 's/^0//')
+          if [ -z "$H" ]; then H=0; fi
+          if [ "$H" -lt 6 ]; then
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::现在是北京 ${H} 点，早于 06:00，微软每日任务通常还没重置，本次不执行"
+          else
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 查询今日完成标记
         id: done
         uses: actions/cache/restore@v4
@@ -56,6 +73,9 @@ jobs:
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             echo "::notice::手动指定 force=true，强制执行"
+          elif [ "${{ steps.win.outputs.open }}" != "true" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::北京 06:00 之前不执行（微软每日任务尚未重置），本次跳过"
           elif [ "${{ steps.done.outputs.cache-hit }}" = "true" ]; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             echo "::notice::今天（${{ steps.d.outputs.day }}）已签到成功过，本次是备用时段，跳过"
@@ -175,14 +195,32 @@ jobs:
           path: sessions
           key: sessions-${{ github.run_id }}
 
+      # 关键：只有「真正拿到分」才写标记。
+      # 微软每日任务在中国区不是北京 00:00 重置（实测 23:19 那轮能拿满 +313，
+      # 而 00:10 跑同一套只剩 +33，且桌面搜索配额仍显示 60/60 已完成）。
+      # 若凌晨那次拿到的是前一天残余，签到本身也是「成功」，照样会写标记，
+      # 结果白天真正能拿分的几个时段全被跳过 —— 当天就白丢了。
+      # 所以这里加阈值：本次增量 < 100 分就当作「微软还没重置」，不写标记，留给后面的时段重试。
       - name: 写今日完成标记
+        id: mark
         if: success()
         run: |
+          set -e
+          GAIN=$(grep -oE '获得积分=[0-9]+' rewards-run.log 2>/dev/null | tail -1 | grep -oE '[0-9]+$' || true)
+          if [ -z "$GAIN" ]; then GAIN=0; fi
+          echo "本次增量=$GAIN"
+          MIN_GAIN=100
+          if [ "$GAIN" -lt "$MIN_GAIN" ]; then
+            echo "::warning::本次只拿到 $GAIN 分（阈值 $MIN_GAIN），疑似微软每日任务尚未重置，不写今日完成标记，后面的时段会继续重试"
+            exit 0
+          fi
           mkdir -p .run-state
-          echo "done at $(TZ=Asia/Shanghai date -Iseconds)" > .run-state/done
+          echo "done at $(TZ=Asia/Shanghai date -Iseconds), gain=$GAIN" > .run-state/done
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::已写入今日完成标记（本次 +$GAIN 分）"
 
       - name: 保存今日标记（后续备用时段看到就跳过）
-        if: success()
+        if: success() && steps.mark.outputs.ok == 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
