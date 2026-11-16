@@ -1,0 +1,50 @@
+# Microsoft Rewards 自动签到（GitHub Actions 版）
+
+基于 [chiihero/Microsoft-Rewards-Script](https://github.com/chiihero/Microsoft-Rewards-Script)（V4-china 中文本地化版，上游 TheNetsky）。
+
+## 结构
+
+- `.github/workflows/rewards-daily.yml` —— 每日北京时间 06:20 自动跑（UTC 22:20），也可手动触发
+- `config.json` —— 运行配置（不进 git，由 Secret 注入）
+- `.env` —— 账号配置（不进 git，由 Secret 注入）
+- `sessions/sessions.db` —— 浏览器会话 + 指纹（不进 git，首次由 Secret 注入，之后走 Actions 缓存滚动）
+
+## 需要的 Secrets
+
+| 名称 | 说明 |
+|---|---|
+| `ACCOUNT_1_EMAIL` | 微软账号邮箱 |
+| `ACCOUNT_1_PASSWORD` | 密码（无密码登录可留空） |
+| `CONFIG_JSON` | 完整 config.json 内容 |
+| `SESSIONS_DB_B64` | `gzip -9 sessions/sessions.db | base64 -w0` 的结果，**只在第一次运行需要** |
+
+## 会话如何续期
+
+1. 第一次运行：从 `SESSIONS_DB_B64` 解出一份 sessions.db
+2. 跑完：`actions/cache/save` 存成 `sessions-<run_id>`（缓存不覆盖，每次新 key）
+3. 下次运行：`restore-keys: sessions-` 前缀匹配，自动取最新那份
+4. 如果某天 cookie 全过期 → 改本地重新登录，更新 `SESSIONS_DB_B64` Secret 即可
+
+> GitHub 缓存 7 天没被访问就会回收，但每天跑一次不会触发回收。
+
+## 本地重新登录并导出 sessions.db
+
+```powershell
+cd ms-rewards
+node login-live.js          # 弹出窗口，登录完自动保存 sessions/storageState-login.json
+node mksession.js           # 生成 sessions/sessions.db + sessions.db.b64
+node gz.js                  # 生成 sessions.db.gz.b64（这个喂给 Secret）
+```
+
+## 手动触发
+
+```powershell
+gh workflow run rewards-daily
+gh run watch
+```
+
+## 说明
+
+- 私有仓库 Actions 每月 2000 分钟免费额度，每天一次约 45 分钟，够用（约 1350 分钟/月）
+- 公开仓库无限额度
+- 定时任务在仓库 60 天无提交后会被 GitHub 自动暂停，需要手动启用或加保活提交

@@ -1,0 +1,103 @@
+name: rewards-daily
+
+on:
+  schedule:
+    # UTC 22:20 = 北京 06:20（GitHub cron 有 0-30 分钟随机延迟）
+    - cron: "20 22 * * *"
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "开启 debug 日志"
+        required: false
+        default: "false"
+
+concurrency:
+  group: rewards-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      # 还原上次跑完保存的会话（滚动缓存，永远取最新一份）
+      - name: 还原会话缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: sessions
+          key: sessions-${{ github.run_id }}
+          restore-keys: |
+            sessions-
+
+      - name: 注入初始会话（首次运行时用）
+        run: |
+          mkdir -p sessions
+          if [ ! -f sessions/sessions.db ] && [ -n "${{ secrets.SESSIONS_DB_B64 }}" ]; then
+            echo "从 Secret 注入 sessions.db"
+            echo "${{ secrets.SESSIONS_DB_B64 }}" | base64 -d | gunzip > sessions/sessions.db
+            ls -l sessions/sessions.db
+          elif [ -f sessions/sessions.db ]; then
+            echo "使用缓存里的 sessions.db"
+            ls -l sessions/sessions.db
+          else
+            echo "::error::既没有缓存也没有 Secret，无法登录"
+            exit 1
+          fi
+
+      - name: 写 config.json
+        run: |
+          cat > config.json <<'JSON'
+          ${{ secrets.CONFIG_JSON }}
+          JSON
+          node -e "JSON.parse(require('fs').readFileSync('config.json','utf8')); console.log('config.json 合法')"
+
+      - name: 写 .env
+        run: |
+          cat > .env <<ENV
+          ACCOUNT_1_EMAIL=${{ secrets.ACCOUNT_1_EMAIL }}
+          ACCOUNT_1_PASSWORD=${{ secrets.ACCOUNT_1_PASSWORD }}
+          ACCOUNT_1_LANG_CODE=zh-CN
+          ACCOUNT_1_GEO_LOCALE=CN
+          ACCOUNT_1_SAVE_FINGERPRINT_MOBILE=false
+          ACCOUNT_1_SAVE_FINGERPRINT_DESKTOP=false
+          ENV
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 安装 Chromium
+        run: npx patchright install --with-deps chromium
+
+      - name: 编译
+        run: npm run build
+
+      - name: 运行签到
+        run: npm start
+        env:
+          DEBUG_MODE: ${{ github.event.inputs.debug }}
+          TZ: Asia/Shanghai
+
+      - name: 保存会话缓存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sessions
+          key: sessions-${{ github.run_id }}
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "### 运行结束" >> $GITHUB_STEP_SUMMARY
+          [ -f sessions/sessions.db ] && ls -lh sessions/sessions.db >> $GITHUB_STEP_SUMMARY || true
