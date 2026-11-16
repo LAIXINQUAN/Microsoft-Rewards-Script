@@ -1,0 +1,46 @@
+# ===================================================================
+# CNB（cnb.cool，腾讯云原生构建）定时兜底配置
+# 作用：每 30 分钟检查一次今天的 GitHub 签到是否已成功，没成功就触发一次。
+#       幂等 —— 今天已成功就直接跳过（不会重复签到）。
+# 为什么用它：微信扫码登录即用，不收实名、不要信用卡，
+#             每月 160 核时免费（1核2G ≈ 160 小时），远超本用途。
+# 用法：把本文件放在仓库根目录，文件名必须是 .cnb.yml
+#       然后在 cnb.cool 里导入本仓库（分支 V4-china），下面 GH_TOKEN 换成真 token。
+# ===================================================================
+
+# 键名 = 定时任务从哪个分支拉代码。必须写明确的单一分支名，不支持通配。
+# 本仓库默认分支是 V4-china；如果你的导入后叫 main，把下面这行改成 main:
+V4-china:
+  # cron 用 POSIX 五段式，时区固定 Asia/Shanghai（不用换算 UTC）
+  # 最小间隔 5 分钟，*/30 = 每 30 分钟一次
+  "crontab: */30 * * * *":
+    - name: rewards-dispatcher
+      # 只要 Node 18+ 就有内置 fetch，node:20 足够，镜像很小启动很快
+      docker:
+        image: node:20
+      env:
+        # ⚠️ 换成你自己的 GitHub token（Fine-grained，权限 Actions: Read and write，只限这两个仓库）
+        # 更安全的做法见文末「用密钥仓库存 token」
+        GH_TOKEN: PASTE_YOUR_GITHUB_TOKEN_HERE
+        TZ: Asia/Shanghai
+      stages:
+        - name: check-and-dispatch
+          script:
+            - node --version
+            - node scripts/ci/ensure-daily-run.mjs
+
+# ---------------------------------------------------------------
+# 用密钥仓库存 token（推荐，避免 token 明文进 git 历史）
+# 1) 在 CNB 建一个「密钥仓库」，里面放 envs.yml：
+#      GH_TOKEN: github_pat_xxxxxxxx
+# 2) 把上面 env: 段的 GH_TOKEN 换成 imports：
+#      imports: https://cnb.cool/<你的密钥仓库slug>/-/blob/main/envs.yml
+#    （imports 与 env 同级，放在 docker 之后；env 与 imports 冲突时 env 优先）
+# ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# 前置开关（不做这一步流水线不会自动跑）：
+#   CNB 里 fork / 导入的仓库默认不执行「定时任务」事件，需手动打开：
+#     仓库 → 设置 → 云原生构建 → 勾选「允许自动触发」
+#   若整个组织关了总开关，还要：组织设置 → 云原生构建 → 允许定时任务自动触发
+# ---------------------------------------------------------------
