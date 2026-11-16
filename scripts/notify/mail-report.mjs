@@ -46,10 +46,16 @@ const stripAnsi = s => String(s || '').replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').r
 function parseRunLog(file = RUN_LOG) {
   if (!fs.existsSync(file)) return null;
   let raw;
-  try { raw = fs.readFileSync(file, 'utf8'); } catch { return null; }
+  try {
+    const buf = fs.readFileSync(file);
+    // 兼容 UTF-16LE（PowerShell 重定向产物）与 UTF-8
+    if (buf[0] === 0xff && buf[1] === 0xfe) raw = buf.toString('utf16le');
+    else if (buf[0] === 0xfe && buf[1] === 0xff) raw = Buffer.from(buf).swap16().toString('utf16le');
+    else raw = buf.toString('utf8');
+  } catch { return null; }
   const lines = raw.split(/\r?\n/).map(stripAnsi);
 
-  let after = null, before = null, gained = null;
+  let after = null, before = null, gained = null, streak = null;
   for (const line of lines) {
     // MAIN [RUN-END] 全部账户完成 | 处理账户数=1 | 获得积分=27 | 原余额=10478 | 现余额=10505 | 运行分钟数=14.9
     // MAIN [ACCOUNT-END] 账户完成: *** | 获得积分=27 | 原余额=10478 | 现余额=10505
@@ -59,9 +65,11 @@ function parseRunLog(file = RUN_LOG) {
     if (mAcc) { gained = Number(mAcc[1]); before = Number(mAcc[2]); after = Number(mAcc[3]); continue; }
     const mFlow = line.match(/MAIN \[FLOW\] 积分已收集.*?现余额=(\d+)/);
     if (mFlow && after == null) after = Number(mFlow[1]);
+    const mStreak = line.match(/连续计数=(\d+)/);
+    if (mStreak && streak == null) streak = Number(mStreak[1]);
   }
   if (after == null) return null;
-  return { after, before, gained: gained ?? (before != null ? after - before : null) };
+  return { after, before, gained: gained ?? (before != null ? after - before : null), streak };
 }
 
 /* ---------------- 二、从 sessions.db + API 取积分（兜底） ---------------- */
@@ -179,6 +187,7 @@ async function collect() {
     progressMax: api.ok ? api.progressMax : null,
     before: prev,
     gained,
+    streak: fromLog?.streak ?? null,
     apiError: api.ok ? null : api.error
   };
 }
@@ -293,8 +302,9 @@ function buildReport(d) {
   L.push('');
   L.push('【当前积分】');
   L.push(`  可用积分：${fmtOpt(now)} 分`);
-  L.push(`  累计积分：${fmtOpt(d.lifetime)} 分`);
-  L.push(`  会员等级：${d.level || '未知'}${d.progress != null ? `（进度 ${fmt(d.progress)}/${fmt(d.progressMax)}）` : ''}`);
+  if (d.lifetime != null) L.push(`  累计积分：${fmt(d.lifetime)} 分`);
+  if (d.level) L.push(`  会员等级：${d.level}${d.progress != null ? `（进度 ${fmt(d.progress)}/${fmt(d.progressMax)}）` : ''}`);
+  if (d.streak != null) L.push(`  连续签到：${d.streak} 天`);
   if (diff != null) L.push(`  本次运行：${diff >= 0 ? '+' : ''}${fmt(diff)} 分${d.before != null ? `（${fmt(d.before)} → ${fmt(now)}）` : ''}`);
   L.push('');
   L.push('【目标进度】');
@@ -311,7 +321,6 @@ function buildReport(d) {
   }
   L.push('');
   L.push(`数据来源：${d.source}`);
-  if (d.apiError) L.push(`（API 兜底未生效：${d.apiError}）`);
   L.push('');
   L.push('—— 本邮件由 GitHub Actions 自动发送');
 
