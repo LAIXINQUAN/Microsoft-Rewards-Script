@@ -337,3 +337,102 @@ Cloudflare Worker / Google Apps Script 当境外备份（代码见上一章）�
 
 - 用真 token 跑 ~node scripts/ci/ensure-daily-run.mjs --dry~ → @@[rewards-daily] 今天已成功（run 43895129200），无需触发@@ / @@[kgcheckin-签到] 今天已成功（run 43895562060），无需触发@@，exit 0
 - 国内直连 ~api.github.com~ 三次：558ms / 59ms / 59ms 全 200，不需要代理
+
+---
+
+## 「凌晨假成功」问题与四层防护（2026-11-17）
+
+### 现象
+
+备用时段第一次跑在**北京 00:10**，run 43904591418 的结果：
+
+- 账面积分只 +33（10505 → 10538），而前一天 23:19 那趟是 **+313**（10159 → 10472）
+- 日志里 `MAIN [SEARCH-MANAGER] 桌面端: skip (complete, 60/60)` —— 桌面搜索额度还是满的
+- 结论：**微软 Rewards 的每日任务不是北京 00:00 重置**，00:10 跑到的只是前一天剩下的零头
+
+危险在于它照样会写 `rewards-done-2026-11-17` 标记，于是当天 06:20 / 07:05 / 08:10 … 所有真正能拿满的时段全部被判「今天已完成」跳过，**白丢一整天积分**。
+
+对照：全民K歌**确实**在北京 00:00 重置（00:10 那趟三个账号各领 8 次全部成功、日期写的是当天），所以 kg 侧不需要这道闸。
+
+### 防护 1：workflow 里的时间窗（gate 新增步骤）
+
+`rewards-daily.yml` 的 gate job 在「计算北京日期」之后加了一步「判断执行时间窗」：
+
+```yaml
+- name: 判断执行时间窗
+  id: win
+  run: |
+    set -e
+    H=$(TZ=Asia/Shanghai date +%H | sed "s/^0//")
+    if [ -z "$H" ]; then H=0; fi
+    if [ "$H" -lt 6 ]; then
+      echo "open=false" >> "$GITHUB_OUTPUT"
+      echo "::notice::现在是北京 ${H} 点，早于 06:00，微软每日任务通常还没重置，本次不执行"
+    else
+      echo "open=true" >> "$GITHUB_OUTPUT"
+    fi
+```
+
+judge 步骤的分支顺序因此变成：**force → 时间窗 → 今日标记 → 执行**。
+
+### 防护 2：增量不足就不写今日标记
+
+原本只要签到步骤 success 就写标记，现在要求**本次获得积分 ≥ 100** 才写：
+
+```bash
+GAIN=$(grep -oE "获得积分=[0-9]+" rewards-run.log | tail -1 | grep -oE "[0-9]+$")
+MIN_GAIN=100
+if [ "$GAIN" -lt "$MIN_GAIN" ]; then
+  echo "::warning::本次只拿到 $GAIN 分（阈值 $MIN_GAIN），疑似微软每日任务尚未重置，不写今日完成标记"
+  exit 0
+fi
+```
+
+阈值依据：满额一轮 +313，凌晨残余 +33，中间的 100 分留足余量。没写标记 → 后面的备用时段会继续重试。
+
+### 防护 3：调度器改用 done key 判据
+
+原来两版兜底脚本（`ensure-daily-run.mjs` / `dispatch-gitee.cjs`）判断「今天跑没跑」是看 run 的 success + job 级 success。问题是：**gate 判定跳过时 job 也是 skipped，但 run 整体仍可能是 success**，容易误判成「已签到」。
+
+现在优先查 **Actions 缓存里的完成标记**：
+
+- rewards：「`rewards-done-<北京日期>`」，调度器设 `doneKey: "rewards-done-"`、`notBeforeHour: 6`
+- kgcheckin：「`kg-done-<北京日期>`」，`doneKey: "kg-done-"`、`notBeforeHour: 1`
+
+命中标记 → 直接判定今天已完成，**不再下钻 jobs**（省 3 次 API 调用，也不受 run 状态误导）。没命中才回退到 job 级校验。
+
+两版都加了同一条时间窗闸：
+
+- `ensure-daily-run.mjs`：`if (!FORCE && typeof t.notBeforeHour === "number" && hour < t.notBeforeHour) continue;`
+- `dispatch-gitee.cjs`：同逻辑，记 `result.action = "too-early"`
+
+### 防护 4：Gitee 流水线 cron 整体后移
+
+`.workflow/rewards-dispatcher.yml` 的定时从 `0 0 */3 * * ?`（每 3 小时，含 00:00）改成：
+
+```yaml
+schedule:
+  - cron: '0 30 6,9,12,15,18,21 * * ?'
+```
+
+即北京 **06:30 / 09:30 / 12:30 / 15:30 / 18:30 / 21:30**，全部排在重置之后。每天 6 次 = 180 次/月 ≈ 180 分钟，在 500 分钟/月免费额度内。
+
+### 实测验证
+
+| 场景 | 命令 | 结果 |
+| --- | --- | --- |
+| GitHub 时间窗闸 | `gh workflow run rewards-daily`（北京 00:43） | run 43910629734：gate success，**执行签到 skipped**，日志 `##[notice]现在是北京 0 点，早于 06:00` |
+| 本机调度器时间窗 | `node scripts/ci/ensure-daily-run.mjs --dry` | `[rewards-daily] 现在北京 0 点，早于 6 点，等下一个窗口` |
+| Gitee 调度器时间窗 | 构建 #3（00:50:24，commit 32fce28） | 日志含 `[rewards-daily] 现在北京 0 点，早于 6 点，等下一个窗口` + `[kgcheckin-签到] 现在北京 0 点，早于 1 点，等下一个窗口` + `=== run end ===` + `=== exit=0 ===`，构建 success |
+| done key 命中 | 临时脚本调 `doneKeyExists` | rewards → `null`（标记已删）；kg → `HIT kg-done-2026-11-17 @ 2026-11-16T16:26:11Z` |
+| Gitee 构建 #4 | 01:0x，commit 91fc909 | runner 横幅升 `v4-donekey` |
+
+### 需要知道的一个取舍
+
+这些闸门是**保守**的：宁可某个时段不跑，也不要写好标记把当天机会锁死。
+所以如果真的想立刻强制跑一轮（比如怀疑微软提前放任务），用：
+
+```powershell
+gh workflow run rewards-daily -f force=true     # 忽略时间窗和今日标记
+node scripts/ci/ensure-daily-run.mjs --force    # 本机调度器强制
+```
