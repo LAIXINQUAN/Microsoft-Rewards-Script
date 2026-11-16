@@ -99,7 +99,9 @@ jobs:
         env:
           TZ: Asia/Shanghai
           DEBUG_MODE: ${{ github.event.inputs.debug }}
-        run: npm start
+        run: |
+          set -o pipefail
+          npm start 2>&1 | tee rewards-run.log
 
       - name: 发送积分邮件
         if: always()
@@ -109,6 +111,7 @@ jobs:
           MAIL_AUTH: ${{ secrets.MAIL_AUTH }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           RUN_STATUS: ${{ job.status }}
+          RUN_LOG: rewards-run.log
         run: node scripts/notify/mail-report.mjs report
       - name: 保存会话缓存
         if: always()
