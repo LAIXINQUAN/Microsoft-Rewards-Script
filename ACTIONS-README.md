@@ -210,3 +210,63 @@ powershell -File scripts\ci\unregister-task.ps1         # 撤销
 dispatch 触发的 run 一样要走 gate：当天已经成功过就直接 `should_run=false` 跳过执行 job，耗时十几秒。所以这个看守脚本每 30 分钟打一次也不会重复签到、不烧额度。
 
 副作用只有一种：如果某天早上 6:20 主时段被丢弃、7:05 也丢了，看守脚本会在下一次检查时补一次 dispatch，签到时间会比平时晚——这正是想要的行为。
+
+---
+
+## 国内第三方平台托管兜底（可选）
+
+本机计划任务只在电脑开机时有效。要 7×24 兜底，可以再挂一层国内云函数——国内访问 ~api.github.com~ 实测直连 60ms，不需要代理。
+
+代码：~scripts/ci/cloud-function-cn.js~（一份代码同时兼容腾讯云 SCF、腾讯云 CloudBase、阿里云 FC、华为云 FunctionGraph、百度 CFC、火山 veFaaS），已打包成可直接上传的 ~scripts/ci/rewards-dispatcher-cn.zip~（内含 ~index.js~ + ~package.json~，2.8KB）。
+
+### 平台对比（免费额度以官方为准）
+
+| 平台 | 免费额度 | 定时最小粒度 | 要实名 | 要信用卡 | 备注 |
+|---|---|---|---|---|---|
+| 腾讯云 SCF | 每月 100 万 GBs + 400 万次调用 | 1 分钟（7 段 cron） | 是 | 否 | **最推荐**，控制台直接传 zip |
+| 腾讯云 CloudBase 云开发 | 有免费额度 | 1 分钟 | 是 | 否 | 和 SCF 同一套代码，走 Web 控制台更简单 |
+| 阿里云函数计算 FC | 每月 40 万 CU·秒 | 1 分钟（6 段 cron，UTC） | 是 | 否 | 需装 ~fun~ CLI 或控制台传 zip |
+| 华为云 FunctionGraph | 每月 100 万次调用 | 1 分钟 | 是 | 否 | 出口 IP 稳定，国内访问 GitHub 也通 |
+| 百度智能云 CFC | 每月 10 万次调用 | 1 分钟 | 是 | 否 | 够用 |
+| 火山引擎 veFaaS | 有免费额度 | 1 分钟 | 是 | 否 | 够用 |
+| 腾讯云函数 + API 网关 | 同上 + 网关免费额度 | - | 是 | 否 | 想暴露 HTTP 入口（给监控打）才需要 |
+
+### 腾讯云 SCF 部署步骤（15 分钟）
+
+1. 打开 https://console.cloud.tencent.com/scf → 函数服务 → 新建
+2. 创建方式选 **从头开始**，函数类型 **事件函数**
+3. 运行环境选 **Node.js 20**（或 18/22，都行）
+4. 函数代码 → 提交方法选 **上传 ZIP 包** → 选本仓库的 ~scripts/ci/rewards-dispatcher-cn.zip~
+5. 执行角色：选「使用默认角色」即可（不需要访问其他腾讯云资源）
+6. 环境变量 → 新增 ~GH_TOKEN~ = 你的 fine-grained PAT（权限：**Actions: Read and write**，仓库限 ~LAIXINQUAN~ 两个仓库即可）
+7. 超时时间改成 **60 秒**（默认 3 秒不够拉 60 条 run 列表）
+8. 内存保持默认 128 MB
+9. 触发器 → 创建触发器 → 类型 **定时触发器** → Cron：@@0 */30 * * * * *@@
+10. 保存 → 在控制台「函数管理 → 函数代码 → 测试」点一次运行，看返回的 ~message~ 里两条目标是不是「今天已成功」
+
+### 阿里云 FC 部署
+
+1. 控制台 https://fcnext.console.aliyun.com → 服务与函数 → 创建函数
+2. 类型选 **事件函数**，运行环境 **Node.js 18**
+3. 代码上传同一个 zip，入口函数写 ~index.handler~
+4. 环境变量 ~GH_TOKEN~ 同上
+5. 函数配置 → 超时时间 60 秒
+6. 触发器 → **定时触发器** → Cron 表达式（UTC 6 段）：@@0,30 * * * *@@
+7. 内存 128 MB
+
+### 代码里的三个共同点（为什么一份代码能到处跑）
+
+1. **不用 global fetch**：云函数 Node 运行时可能没有，全部走内置 ~node:https~
+2. **自己算北京日期**：云函数地域时区不一定是 +8，~beijingDate()~ 直接 ~+8h~ 再取日期
+3. **导出三个 handler 名**：~main_handler~（SCF）/ ~main~（CloudBase）/ ~handler~（阿里云、华为云、百度、火山），配合 ~package.json~ 的 @@"type":"commonjs"@@ 直接跑
+
+### 判定逻辑和本机版一致
+
+不会因为 gate 跳过就误判「今天已完成」：对每个 ~success~ 的 run 都会下钻到 ~/actions/runs/<id>/jobs~ 确认存在 ~conclusion=success~ 且名字匹配 ~执行签到|签到|run~ 的 job。
+
+### 实测记录
+
+- 本地用真实 token 跑 ~runAll({},{})~ → 输出 @@[2026-11-16] rewards-daily: 今天已成功（run 43895129200），无需触发 | kgcheckin-签到: 今天已成功（run 43895562060），无需触发@@
+- 用假 token 跑 → 正确捕获 HTTP 401 并写进返回值，不崩
+- 国内直连 ~https://api.github.com/rate_limit~：558ms / 59ms / 59ms（三次）
+- 已随仓库推送：~scripts/ci/cloud-function-cn.js~（5603 B）、~scripts/ci/rewards-dispatcher-cn.zip~（2855 B）
