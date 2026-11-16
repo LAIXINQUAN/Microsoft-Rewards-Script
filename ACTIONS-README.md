@@ -74,23 +74,24 @@ gh run watch
 
 ## 邮件日报
 
-签到跑完（无论成功失败）自动发一封积分报告邮件，收件人 `3766308071@qq.com` + `525177186@qq.com`，发件 `laixinqb@foxmail.com`。
+签到跑完（无论成功失败）自动发积分报告，收件人 `3766308071@qq.com` + `525177186@qq.com`，发件 `laixinqb@foxmail.com`。
 
-内容包含：
-- 当前可用积分 / 累计积分 / 会员等级与进度
-- 本次运行增减（用运行前后快照对比）
-- 距「中国石化礼品卡 500 元（96,530 分）」还差多少分、完成度百分比、进度条
-- 按本次增量估算还需几天
+内容：
+- 当前可用积分、累计积分、会员等级与等级进度、连续签到天数（能取到才显示）
+- 本次运行增量 `+N 分（原余额 → 现余额）`
+- 距「中国石化礼品卡 500 元（96,530 分）」还差多少、完成度百分比、进度条、按当日增量估算还需几天
 
-实现：`scripts/notify/mail-report.mjs`，零依赖（手写 SMTP over TLS，只用 Node 内置模块），不额外装包。
+积分取值优先级：
+1. **签到日志**（`rewards-run.log`，由 workflow 的 `tee` 生成）——解析 `MAIN [RUN-END]` / `MAIN [ACCOUNT-END]` 行的 `获得积分=|原余额=|现余额=`，并抓 `连续计数=N`。最可靠，不依赖 cookie。
+2. **Rewards API**（sessions.db 里的 cookie 调 `getuserinfo`）——仅当日志缺失时兜底，用于补累计积分/等级。云端 IP 上这个接口常返回 401，属正常。
 
-流程：
-1. `capture` —— 签到前读一次积分存 `.points-before.json`
-2. `report` —— 签到后读积分、算差值、发信
+实现：`scripts/notify/mail-report.mjs`，零依赖（手写 SMTP over TLS + node:sqlite），不额外装包。
 
-手动本地测：
+流程：`capture`（签到前 API 快照，失败不影响）→ 签到 `tee rewards-run.log` → `report`（解析日志 + 发信）。
+
+本地测：
 ```powershell
-$env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs dry    # 只看正文不发
+$env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs dry    # 只看正文
 $env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs send   # 真发
 ```
 
