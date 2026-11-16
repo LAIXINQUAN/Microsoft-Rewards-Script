@@ -147,18 +147,66 @@ gh workflow run rewards-daily --repo LAIXINQUAN/Microsoft-Rewards-Script --ref V
 gh run watch
 ```
 
-### 仓库外兜底（可选，做了一层就没配）
+### 本机兜底调度器（已配好）
 
-上面的方案全在 GitHub 内部，极端情况（整个 Actions 区域性故障、免费额度用尽）仍会漏。想再加一层外部定时器：
+上面几条全在 GitHub 内部，极端情况（Actions 区域性故障、额度用尽、schedule 长时间抽风）仍会整天漏掉。所以在本机挂了一个每 30 分钟跑一次的看守脚本，主动去 **查** 今天的真实执行结果，没成功才 dispatch。
 
-1. 建一个 fine-grained PAT，只给目标仓库 `Actions: write` 权限
-2. 到 [cron-job.org](https://cron-job.org) 建任务，每 30 分钟 POST 一次：
+**脚本**：`scripts/ci/ensure-daily-run.mjs`（零依赖，Node 18+ built-in fetch）
 
 ```
-POST https://api.github.com/repos/LAIXINQUAN/Microsoft-Rewards-Script/actions/workflows/rewards-daily.yml/dispatches
-Authorization: Bearer <PAT>
-Accept: application/vnd.github+json
-{"ref":"V4-china","inputs":{"force":"false"}}
+node scripts\ci\ensure-daily-run.mjs            # 正常跑：查 + 必要时 dispatch
+node scripts\ci\ensure-daily-run.mjs --dry      # 只看判断结果，不触发
+node scripts\ci\ensure-daily-run.mjs --force    # 忽略今日标记，强制 dispatch
+node scripts\ci\ensure-daily-run.mjs --only=kg  # 只处理 kgcheckin
 ```
 
-因为带了幂等闸，外部定时器每 30 分钟无脑打一次是安全的——只有当天没成功时才真正开跑。
+**监的两个目标**（写在文件顶部的 `TARGETS` 数组里）：
+
+| 标签 | 仓库 | workflow id | ref |
+|---|---|---|---|
+| rewards-daily | LAIXINQUAN/Microsoft-Rewards-Script | 420202401 | V4-china |
+| kgcheckin-签到 | LAIXINQUAN/kgcheckin | 372755970 | main |
+
+**判定逻辑（关键：不能只看 run 的 conclusion）**
+
+gate 跳过的 run 也是 `conclusion=success`，直接判断会误以为今天已经签到过。所以脚本会下钻到 job 级别：
+
+1. 拉该 workflow 当天（按北京日期）的 runs
+2. 有 `in_progress` / `queued` 的 → 正在跑，什么都不做
+3. 对最多前 3 个 `success` 的 run 逐个查 `/actions/runs/<id>/jobs`，看有没有名字匹配 `执行签到|签到|run` 且 `conclusion=success` 的 job
+4. 全都不满足 → `POST /actions/workflows/<id>/dispatches`
+
+**token**：优先 `GITHUB_TOKEN` / `GH_TOKEN` 环境变量，否则调 `gh auth token`（Windows 下先试 `C:\Program Files\GitHub CLI\gh.exe` 绝对路径，再试 PATH 里的 `gh`——计划任务里的 PATH 很短，绝对路径这步不能省）。
+
+**日志**：`%USERPROFILE%\.rewards-dispatcher\log.txt`，超过 256 KB 自动清空。
+
+#### 挂成 Windows 计划任务
+
+```
+cd ms-rewards
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ci\register-task.ps1
+```
+
+注册出来的任务：
+
+- 名字：`RewardsDailyDispatcher`
+- 动作：`node <repo>\scripts\ci\ensure-daily-run.mjs`
+- 触发：每 30 分钟一次，持续 3650 天，`-StartWhenAvailable`（睡过头/关机错过会补跑）
+- 设置：允许电池运行、不因切电池停止、多实例忽略新、单次最长 15 分钟
+
+常用操作：
+
+```
+Start-ScheduledTask -TaskName RewardsDailyDispatcher      # 立即试跑一次
+Get-ScheduledTaskInfo -TaskName RewardsDailyDispatcher    # 看上次结果/下次时间
+Get-Content (Join-Path $env:USERPROFILE '.rewards-dispatcher\log.txt') -Tail 20 -Encoding UTF8   # 看日志
+powershell -File scripts\ci\unregister-task.ps1         # 撤销
+```
+
+> 计划任务按**当前用户**注册，只在登录状态下运行。电脑长期关机的话它也不会跑——那种情况下靠 GitHub 里的 5 个 cron 就够。
+
+#### 为什么外部无脑打是安全的
+
+dispatch 触发的 run 一样要走 gate：当天已经成功过就直接 `should_run=false` 跳过执行 job，耗时十几秒。所以这个看守脚本每 30 分钟打一次也不会重复签到、不烧额度。
+
+副作用只有一种：如果某天早上 6:20 主时段被丢弃、7:05 也丢了，看守脚本会在下一次检查时补一次 dispatch，签到时间会比平时晚——这正是想要的行为。
