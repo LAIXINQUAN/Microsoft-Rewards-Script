@@ -96,3 +96,69 @@ $env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs send   # 
 ```
 
 Secrets：`MAIL_FROM` / `MAIL_AUTH` / `MAIL_TO`
+
+---
+
+## 抗「高峰期任务被丢弃」（2026-11-16）
+
+GitHub 的 `schedule` 触发器在整点/高负载时段会**直接丢弃**本次触发（不会补跑、不会报错，run 列表里根本没有这一次）。单个 cron 每天只有一次机会，赶上就是整天没签到。
+
+本仓库做了四层保险：
+
+### 1. 多时段备用 cron
+
+`rewards-daily.yml` 里有 5 个 cron，北京时间为 06:20 / 07:05 / 08:10 / 10:20 / 13:40（全部错开整点）：
+
+| cron (UTC) | 北京时间 |
+|---|---|
+| `20 22 * * *` | 06:20（主） |
+| `5 23 * * *` | 07:05 |
+| `10 0 * * *` | 08:10 |
+| `20 2 * * *` | 10:20 |
+| `40 5 * * *` | 13:40 |
+
+只要 5 次里有 1 次被调度到，当天就算拿到分。
+
+### 2. 幂等闸（gate job）
+
+多 cron 的副作用是可能跑多遍。所以 `run` job 前加了一个 `gate` job：
+
+1. 算北京日期 `D`
+2. `actions/cache/restore` 找 key = `rewards-done-<D>`
+3. 命中 → `should_run=false`，`run` job 被 `if` 跳过（耗时十几秒，不浪费额度）
+4. 未命中 → 正常执行
+
+签到 job 只有 `success()` 时才 `actions/cache/save` 那个标记 key，所以**失败的日子后面的备用时段还会重试**，成功当天则只跑一次。
+
+### 3. concurrency 排队而不是并行
+
+`cancel-in-progress: false`，所以备用时段撞上主时段在跑时会排队；等前一个跑完，它自己再查标记，看到已完成就跳过。不会出现两个 Chromium 同时抢同一个账号。
+
+### 4. 保活（防止 Actions 被整体停用）
+
+GitHub 在仓库连续 60 天无提交后会自动停用 `schedule`。`keepalive.yml` 每月 3 个非整点时段（1 号 03:17、11 号 07:43、21 号 11:26 UTC）各跑一次提交 `.github/KEEPALIVE.md`，任意一次成功即可。
+
+### 手动兜底
+
+`workflow_dispatch` 带 `force=true` 会忽略当日标记强制执行：
+
+```powershell
+gh workflow run rewards-daily --repo LAIXINQUAN/Microsoft-Rewards-Script --ref V4-china -f force=true
+gh run watch
+```
+
+### 仓库外兜底（可选，做了一层就没配）
+
+上面的方案全在 GitHub 内部，极端情况（整个 Actions 区域性故障、免费额度用尽）仍会漏。想再加一层外部定时器：
+
+1. 建一个 fine-grained PAT，只给目标仓库 `Actions: write` 权限
+2. 到 [cron-job.org](https://cron-job.org) 建任务，每 30 分钟 POST 一次：
+
+```
+POST https://api.github.com/repos/LAIXINQUAN/Microsoft-Rewards-Script/actions/workflows/rewards-daily.yml/dispatches
+Authorization: Bearer <PAT>
+Accept: application/vnd.github+json
+{"ref":"V4-china","inputs":{"force":"false"}}
+```
+
+因为带了幂等闸，外部定时器每 30 分钟无脑打一次是安全的——只有当天没成功时才真正开跑。
