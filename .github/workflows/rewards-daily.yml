@@ -90,12 +90,26 @@ jobs:
       - name: 编译
         run: npm run build
 
+      - name: 记录运行前积分
+        continue-on-error: true
+        env:
+          MAIL_AUTH: ${{ secrets.MAIL_AUTH }}
+        run: node scripts/notify/mail-report.mjs capture
       - name: 运行签到
         env:
           TZ: Asia/Shanghai
           DEBUG_MODE: ${{ github.event.inputs.debug }}
         run: npm start
 
+      - name: 发送积分邮件
+        if: always()
+        continue-on-error: true
+        env:
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_AUTH: ${{ secrets.MAIL_AUTH }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          RUN_STATUS: ${{ job.status }}
+        run: node scripts/notify/mail-report.mjs report
       - name: 保存会话缓存
         if: always()
         uses: actions/cache/save@v4
