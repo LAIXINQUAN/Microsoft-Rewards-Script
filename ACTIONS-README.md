@@ -69,3 +69,29 @@ gh run watch
 - Actions 报 `既没有缓存也没有 SESSIONS_DB_B64`：重新本地登录导出 sessions.db 更新 Secret
 - Actions 报 `Login failed`：cookie 过期，本地重登
 - 想改搜索条数：改 config.json → 更新 `CONFIG_JSON` Secret
+
+---
+
+## 邮件日报
+
+签到跑完（无论成功失败）自动发一封积分报告邮件，收件人 `3766308071@qq.com` + `525177186@qq.com`，发件 `laixinqb@foxmail.com`。
+
+内容包含：
+- 当前可用积分 / 累计积分 / 会员等级与进度
+- 本次运行增减（用运行前后快照对比）
+- 距「中国石化礼品卡 500 元（96,530 分）」还差多少分、完成度百分比、进度条
+- 按本次增量估算还需几天
+
+实现：`scripts/notify/mail-report.mjs`，零依赖（手写 SMTP over TLS，只用 Node 内置模块），不额外装包。
+
+流程：
+1. `capture` —— 签到前读一次积分存 `.points-before.json`
+2. `report` —— 签到后读积分、算差值、发信
+
+手动本地测：
+```powershell
+$env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs dry    # 只看正文不发
+$env:MAIL_AUTH="amirmjckxtfscdbg"; node scripts\notify\mail-report.mjs send   # 真发
+```
+
+Secrets：`MAIL_FROM` / `MAIL_AUTH` / `MAIL_TO`
