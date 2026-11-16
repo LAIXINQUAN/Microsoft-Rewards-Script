@@ -22,3 +22,11 @@ note
 /.zcode/
 /scripts/tests
 /docs
+# 本地登录/导出工具与一次性产物
+login-live.js
+mksession.js
+export-db.js
+sessions.db.b64
+sessions.db.gz.b64
+run-local.log
+ACTIONS-README.md
