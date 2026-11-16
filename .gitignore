@@ -29,4 +29,7 @@ export-db.js
 sessions.db.b64
 sessions.db.gz.b64
 run-local.log
+run.log
+rewards-run.log
+.points-before.json
 ACTIONS-README.md
