@@ -270,3 +270,70 @@ dispatch 触发的 run 一样要走 gate：当天已经成功过就直接 `shoul
 - 用假 token 跑 → 正确捕获 HTTP 401 并写进返回值，不崩
 - 国内直连 ~https://api.github.com/rate_limit~：558ms / 59ms / 59ms（三次）
 - 已随仓库推送：~scripts/ci/cloud-function-cn.js~（5603 B）、~scripts/ci/rewards-dispatcher-cn.zip~（2855 B）
+
+---
+
+## 不用实名的中国平台（含实测可用度）
+
+问题背景：腾讯云 SCF、阿里云 FC、华为云 FunctionGraph、百度 CFC、火山 veFaaS 都要**实名认证**（上传身份证/营业执照）。下面这些能跑定时任务、又不需要上传身份证。
+
+### 首选：CNB（cnb.cool，腾讯云原生构建）
+
+- **登录**：微信扫码。不填身份证、不要信用卡。
+- **免费额度**（官方定价页 https://docs.cnb.cool/zh/pricing.html）：云原生构建 **160 核时/月**（1 核 2G 折合 160 小时）、仓库存储 100 GiB、对象存储 100 GiB、AI Credits 500/月。本用途每 30 分钟一次、每次约 10 秒 → 每月约 **2.4 小时**，占免费额度 1.5%。
+- **定时能力**（官方文档 https://docs.cnb.cool/zh/build/crontab.md）：
+  - 配置放仓库根目录 **.cnb.yml**
+  - 定时触发器写成 key：@@main:  {  "crontab: 30 5,17 * * *": ... }@@
+  - **时区固定 Asia/Shanghai**，不用换算 UTC（比 GitHub 舒服）
+  - **最小间隔 5 分钟**；低于 5 分钟（如 @@* * * * *@@）不允许提交
+  - 同一分支可写多个 crontab key = 多个时段
+  - 分支必须写**明确的单一分支名**，**不支持 glob**
+  - 触发身份 = 「最后修改并推送该 crontab 配置的人」；此人被移出仓库则定时任务失败
+  - 定时任务的 CNB_TOKEN 默认**只能访问当前仓库**，跨仓库需组织管理员开「允许定时任务跨仓操作」
+- **⚠️ 必做开关**：fork / 导入的仓库**默认不执行「定时任务」事件**。必须进 仓库 → 设置 → 云原生构建 → 勾选「允许自动触发」；组织层还有「允许定时任务自动触发」总开关（默认开）。依据：https://docs.cnb.cool/zh/build/trigger-rule.md
+- **已备好的文件**：仓库根目录 **.cnb.yml**（已推送，分支 V4-china）= node:20 镜像 + 每 30 分钟跑 ~scripts/ci/ensure-daily-run.mjs~。只需把 GH_TOKEN 换成真 token。
+- **token 安全**：别明文提交。CNB 有「密钥仓库」，放个 envs.yml 写 GH_TOKEN，.cnb.yml 里改用 ~~imports: https://cnb.cool/<slug>/-/blob/main/envs.yml~~（env 与 imports 冲突时 env 优先）。
+
+### 备选 1：Gitee Go（码云流水线）
+
+- **实名**：注册只要邮箱/手机号，开流水线不上传身份证。
+- **免费额度**（https://help.gitee.com/gitee-go/price）：单个代码仓库 **200 分钟**构建时长**永久**有效；个人/组织每月额外 **500 分钟**自动到账。本用途别 30 分钟一次，改每小时或一天几次。
+- **定时触发**（https://help.gitee.com/gitee-go/pipeline/trigger）：
+  ```yaml
+  triggers:
+    schedule:
+      - cron: '0 0/30 * * * ?'
+  ```
+  - **目前只支持写一个 cron 表达式**，不支持多时段
+  - **Quartz 风格**（秒在前，6~7 段；「日」与「星期」不能同时为 *，不用的写 ?）
+- **落地方式**（https://help.gitee.com/gitee-go/quick-start）：图形视图或代码视图编排 → 保存后平台自动往仓库提交 yaml。模型 = 流水线 → 阶段 → 任务（一个任务 = 一个插件），跑 node 脚本选「Shell 脚本执行」。
+- **已备好的文件**：~scripts/ci/gitee-go-pipeline.yml~（已推送）。⚠️ Gitee Go 的 YAML 插件结构各版本有出入，导入报错就改用图形视图点选。
+
+### 备选 2：AtomGit / GitCode 流水线
+
+- 语法几乎等于 GitHub Actions：放 **.gitcode/workflows/**（不是 .github/workflows），支持 @@on: schedule: - cron: '0 2 * * *'@@，也支持 workflow_dispatch。
+- **卡点**：快速开始页明确写「前提条件：**申请获取代码化流水线内测名额**（内测名额有限，详情请咨询 AtomGit 客服）」。不能自助开通。
+- 结论：能用但不可控，排最后。
+
+### 明确不合适的
+
+| 平台 | 为什么不行 |
+| --- | --- |
+| Vercel Hobby | cron 每天最多触发一次 |
+| Zapier | 免费按月任务数，两天跑光 |
+| Pipedream | 有每日调用上限 |
+| Render / Railway / Fly | 定时任务基本在付费档 |
+| Gitee Pages / 静态托管 | 只有静态文件，没有后台定时 |
+| 阿里云云效 Flow | 组织功能需实名认证 |
+| 华为云 / 百度 / 火山 函数计算 | 都要实名 |
+
+### 一句话选型
+
+**要现在落地 → CNB**（微信登录、不实名、160 核时/月、时区就是北京时间、.cnb.yml 已写好并推送）。
+Gitee Go 当第二备份（500 分钟/月够用，但 cron 只能写一条）。
+Cloudflare Worker / Google Apps Script 当境外备份（代码见上一章）。
+
+### 本机实测（2026-11-16）
+
+- 用真 token 跑 ~node scripts/ci/ensure-daily-run.mjs --dry~ → @@[rewards-daily] 今天已成功（run 43895129200），无需触发@@ / @@[kgcheckin-签到] 今天已成功（run 43895562060），无需触发@@，exit 0
+- 国内直连 ~api.github.com~ 三次：558ms / 59ms / 59ms 全 200，不需要代理
