@@ -1,0 +1,41 @@
+# ===================================================================
+# Gitee Go 定时兜底（备选方案，非首选）
+# 放置位置：仓库根目录  .workflow/rewards-dispatcher.yml
+# 开通：仓库 → 服务 → Gitee Go → 启用（个人免费额度 500 分钟/月）
+#
+# ⚠️ 三个注意：
+# 1) Gitee Go 的定时触发「目前仅支持填写一个 cron 表达式」，不支持多时段；
+#    所以这里靠脚本自身幂等（今天已成功就跳过），每 30~60 分钟打一次即可。
+# 2) cron 是 Quartz 风格（6~7 段，秒在前；「日」和「星期」不能同时写 *，
+#    不用的那个写 ?）。下面 0 0/30 * * * ?  = 每 30 分钟整点。
+# 3) Gitee Go 的 YAML 结构（stages/steps/插件名）在不同版本略有差异，
+#    若导入报错，用「图形视图」新建一条流水线、选「Shell 脚本执行」任务，
+#    把最后那段 node 命令填进去，结构由页面自动生成，最稳。
+# ===================================================================
+
+version: 1.0
+name: rewards-dispatcher
+displayName: 签到兜底调度
+
+triggers:
+  schedule:
+    - cron: '0 0/30 * * * ?'
+
+stages:
+  - stage:
+      name: check-and-dispatch
+      displayName: 检查今日签到并触发
+      steps:
+        - step: shell@agent
+          name: run-dispatcher
+          displayName: 运行兜底脚本
+          inputs:
+            envs:
+              # ⚠️ 换成你的 GitHub token（Fine-grained，Actions: Read and write）
+              - name: GH_TOKEN
+                value: PASTE_YOUR_GITHUB_TOKEN_HERE
+              - name: TZ
+                value: Asia/Shanghai
+            script: |
+              node --version
+              node scripts/ci/ensure-daily-run.mjs
