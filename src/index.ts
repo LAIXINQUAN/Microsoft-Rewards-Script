@@ -809,7 +809,9 @@ export class MicrosoftRewardsBot {
                     this.logger.info('main', 'FLOW', '移动端登录浏览器已关闭；继续使用已保存的会话和 HTTP 请求')
                 }
 
-                const data: DashboardData = await this.browser.func.getDashboardData()
+                // 用不抛版本：云端实测主接口与 flyout 双双失败时，这里裸 await 会把整轮判死，
+                // 连桌面搜索都跑不到。降级后至少搜索、签到这些独立环节还能继续。
+                const data: DashboardData = await this.browser.func.getDashboardDataSafe()
                 const hasBotScoreWarning =
                     Array.isArray(data.dashboard.userWarnings) &&
                     data.dashboard.userWarnings.some(warning => warning?.name === 'Fraud_UserWarning_BotScore_UX')
