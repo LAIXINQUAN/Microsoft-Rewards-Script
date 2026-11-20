@@ -244,6 +244,23 @@ function alreadyDoneToday(token, target, today) {
   });
 }
 
+// fork 仓库的 Actions 可能被 GitHub 单方面关掉（dispatch 一律 422，但仓库设置里 enabled 还是 true）。
+// 先探一次 workflow 列表：拿得到就说明 Actions 活着，拿不到就把怎么修直接打出来，别让人去猜。
+function preflight(token, target) {
+  return ghRequest('GET', '/repos/' + target.repo + '/actions/workflows?per_page=1', null, token)
+    .then(function () { return true; })
+    .catch(function (e) {
+      const msg = String((e && e.message) || e);
+      if (/disabled/i.test(msg)) {
+        log('!! ' + target.repo + ' 的 Actions 被 GitHub 关掉了（fork 闸门），本次触发必然 422。修法：');
+        log('   打开 https://github.com/' + target.repo + '/actions 点绿色 "I understand my workflows, go ahead and re-enable them"');
+      } else {
+        log('?? 预检 ' + target.repo + ' 失败（' + msg.slice(0, 120) + '），照常尝试触发');
+      }
+      return false;
+    });
+}
+
 function dispatchWorkflow(token, target) {
   return ghRequest('POST', '/repos/' + target.repo + '/actions/workflows/' + target.workflowId + '/dispatches',
     { ref: target.ref }, token);
@@ -290,14 +307,37 @@ function handleOne(token, t, today, opts, results) {
         results.push({ label: t.label, action: 'would-dispatch' });
         return null;
       }
-      return dispatchWorkflow(token, t)
-        .then(function () {
-          log('[' + t.label + '] 今天还没成功，已触发 -> ' + t.repo + ' workflow ' + t.workflowId + ' ref ' + t.ref);
-          results.push({ label: t.label, action: 'dispatched' });
-        })
-        .catch(function (e) {
-          log('[' + t.label + '] 触发失败：' + String(e && e.message).slice(0, 160));
-          results.push({ label: t.label, action: 'error', detail: String(e && e.message) });
+      return preflight(token, t)
+        .then(function (alive) {
+          if (!alive) {
+            results.push({ label: t.label, action: 'error', detail: 'Actions disabled on fork (needs manual re-enable)' });
+            return null;
+          }
+          return dispatchWorkflow(token, t)
+            .then(function () {
+              log('[' + t.label + '] 今天还没成功，已触发 -> ' + t.repo + ' workflow ' + t.workflowId + ' ref ' + t.ref);
+              results.push({ label: t.label, action: 'dispatched' });
+            })
+            .catch(function (e) {
+              const msg = String((e && e.message) || e);
+              log('[' + t.label + '] 触发失败：' + msg.slice(0, 160));
+              if (/Actions has been disabled/i.test(msg)) {
+                // GitHub 对 fork 仓库有独立闸门：actions/permissions 的 enabled 仍是 true，
+                // 但 dispatch 一律 422。只能人工点一次「re-enable」，API 改不动。
+                raw('');
+                raw('==============================================================');
+                raw('!! GitHub 把 ' + t.repo + ' 的 Actions 关了（fork 仓库常见）');
+                raw('!! 现象：HTTP 422 "Actions has been disabled for this repository."');
+                raw('!! 注意：仓库 Settings -> Actions 里仍然是 enabled，那开关管不到这个。');
+                raw('!! 修法（一次性，人工 30 秒）：');
+                raw('!!   1) 浏览器打开 https://github.com/' + t.repo + '/actions');
+                raw('!!   2) 点绿色按钮 "I understand my workflows, go ahead and re-enable them"');
+                raw('!!   3) 看到顶部蓝色 "Actions Enabled." 就好了，下一次定时会自动恢复');
+                raw('==============================================================');
+                raw('');
+              }
+              results.push({ label: t.label, action: 'error', detail: msg });
+            });
         });
     });
 }
