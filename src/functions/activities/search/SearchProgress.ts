@@ -19,7 +19,8 @@ export class SearchProgress {
     constructor(private readonly bot: MicrosoftRewardsBot) {}
 
     public async getCounters(): Promise<Counters> {
-        const dashboard = await this.bot.browser.func.getDashboardData()
+        // 用不抛版本：搜索进度查询失败不该让整个搜索环节崩掉（会退到本轮缓存的仪表板）。
+        const dashboard = await this.bot.browser.func.getDashboardDataSafe()
         return dashboard.dashboard.userStatus.counters
     }
 
