@@ -25,6 +25,14 @@ export default class BrowserFunc {
 
     private botMetricsLoggedPlatforms = new Set<string>()
 
+    // 最近一次拿到的仪表板（主接口或 flyout），用于两件事：
+    // 1) 请求再失败时回落，避免整轮直接抛死；2) 把仪表板里的 offer（含 hash）登记成索引，
+    // 让 ensureOffer 在 /earn 快照里找不到时也能命中 —— 云端实测 /earn、/dashboard 的 HTML
+    // 都不含 Gamification_DailySet，但 flyout 的 dailySetPromotions 是带 hash 的。
+    private lastDashboard: DashboardData | null = null
+
+    private dashboardOfferIndex = new Map<string, ParsedOffer>()
+
     constructor(bot: MicrosoftRewardsBot) {
         this.bot = bot
     }
@@ -55,6 +63,7 @@ export default class BrowserFunc {
 
                     if (response.data?.dashboard) {
                         this.logBotDetectionMetrics(response.data)
+                        this.rememberDashboard(response.data)
                         return response.data
                     }
                     throw new Error('Dashboard data missing from API response')
@@ -79,7 +88,24 @@ export default class BrowserFunc {
             )
         }
 
-        return await this.getFlyoutDashboardData(cookies, fingerprintHeaders)
+        try {
+            const dashboard = await this.getFlyoutDashboardData(cookies, fingerprintHeaders)
+            this.rememberDashboard(dashboard)
+            return dashboard
+        } catch (error) {
+            // 兜底失败不能灭整轮：有本轮的仪表板缓存就沿用（快照掉线时靠它继续跑 DailySet / 搜索），
+            // 连缓存都没有才抛给上层，由 Main 走降级仪表板。
+            const cached = this.lastDashboard
+            if (cached) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'GET-DASHBOARD-DATA',
+                    `主接口与 Bing flyout 均失败，沿用本轮缓存的仪表板 | 信息=${this.errorMessage(error)}`
+                )
+                return cached
+            }
+            throw error
+        }
     }
 
     private async getFlyoutDashboardData(
@@ -100,7 +126,9 @@ export default class BrowserFunc {
                     Referer: `${URLs.bing.origin}/`,
                     Origin: URLs.bing.origin
                 },
-                retries: 0
+                // 云端实测 flyout 会偶发 500：这里交给 HttpClient 做退避重试（0→2 共 3 次尝试，
+                // 退避 1s+2s），比一次失败就判死整轮划算得多。
+                retries: 2
             })
 
             await this.applyResponseCookies(URLs.bing.rewardsFlyoutUserInfo, response.headers['set-cookie'])
@@ -150,6 +178,218 @@ export default class BrowserFunc {
 
     private errorMessage(error: unknown): string {
         return error instanceof Error ? error.message : String(error)
+    }
+
+    private todayStamp(): string {
+        const now = new Date()
+        const month = String(now.getMonth() + 1).padStart(2, '0')
+        const day = String(now.getDate()).padStart(2, '0')
+        return `${now.getFullYear()}-${month}-${day}`
+    }
+
+    private normaliseDashboardDate(raw?: string): string | null {
+        if (!raw) return null
+        const trimmed = raw.trim()
+        const slash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(trimmed)
+        if (slash) {
+            const month = (slash[1] ?? '0').padStart(2, '0')
+            const day = (slash[2] ?? '0').padStart(2, '0')
+            return `${slash[3] ?? ''}-${month}-${day}`
+        }
+        return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null
+    }
+
+    private isTruthyFlag(value: unknown): boolean {
+        if (typeof value === 'boolean') return value
+        if (typeof value === 'number') return value > 0
+        if (typeof value === 'string') {
+            const normalised = value.trim().toLowerCase()
+            return normalised === 'true' || normalised === 'complete' || normalised === '1'
+        }
+        return false
+    }
+
+    private isOfferReportable(offer: ParsedOffer, today: string): boolean {
+        return (
+            Boolean(offer.hash) &&
+            !offer.isCompleted &&
+            !offer.isLocked &&
+            (offer.date === null || offer.date <= today)
+        )
+    }
+
+    // 把仪表板里的一条 promotion（主接口或 flyout 的字段名混着来）转成 ParsedOffer。
+    // 目的：云端 /earn 与 /dashboard 的 HTML 都不含 Gamification_DailySet，但仪表板
+    // （flyout 的 dailySetPromotions）是带 hash 的 —— 有了它 UrlReward 才能上报。
+    private toParsedOffer(raw: unknown, date: string | null, today: string): ParsedOffer | null {
+        if (!raw || typeof raw !== 'object') return null
+        const obj = raw as Record<string, unknown>
+
+        const offerIdRaw = obj.offerId ?? obj.offerid
+        const offerId = typeof offerIdRaw === 'string' ? offerIdRaw : ''
+        if (!offerId) return null
+
+        const attributes = (
+            obj.attributes && typeof obj.attributes === 'object' ? obj.attributes : {}
+        ) as Record<string, unknown>
+
+        const hashRaw = obj.hash ?? attributes.hash
+        const hash = typeof hashRaw === 'string' && hashRaw ? hashRaw : null
+
+        const isCompleted =
+            this.isTruthyFlag(obj.complete) ||
+            this.isTruthyFlag(attributes.complete) ||
+            this.isTruthyFlag(attributes.State) ||
+            this.isTruthyFlag(attributes.state)
+
+        const lockRaw = obj.exclusiveLockedFeatureStatus ?? attributes.exclusiveLockedFeatureStatus
+        const isLocked = typeof lockRaw === 'string' && lockRaw.trim().toLowerCase() === 'locked'
+
+        const isPromotional =
+            this.isTruthyFlag(obj.isPromotional) || this.isTruthyFlag(attributes.promotional)
+
+        const activityTypeRaw =
+            obj.activityType ?? obj.activity_type ?? attributes.activityType ?? attributes.activity_type
+        const parsedActivityType = Number(activityTypeRaw)
+
+        const pointsRaw = obj.pointProgressMax ?? obj.points ?? attributes.max
+        const pointsValue = Number(pointsRaw)
+        const points = Number.isFinite(pointsValue) ? pointsValue : 0
+
+        const dateRaw =
+            date ??
+            this.normaliseDashboardDate(
+                typeof obj.date === 'string'
+                    ? obj.date
+                    : typeof attributes.daily_set_date === 'string'
+                      ? attributes.daily_set_date
+                      : undefined
+            )
+
+        const titleRaw = obj.title ?? attributes.title
+        const destinationRaw = obj.destinationUrl ?? obj.destination ?? attributes.destination
+        const promotionSubtypeRaw = obj.promotionSubtype
+
+        const offer: ParsedOffer = {
+            offerId,
+            hash,
+            title: typeof titleRaw === 'string' ? titleRaw : '',
+            description: typeof obj.description === 'string' ? obj.description : '',
+            points,
+            promotionSubtype: typeof promotionSubtypeRaw === 'string' ? promotionSubtypeRaw : null,
+            destination: typeof destinationRaw === 'string' ? destinationRaw : '',
+            isCompleted,
+            isPromotional,
+            isLocked,
+            unlockCriteria: null,
+            date: dateRaw,
+            activityType:
+                Number.isInteger(parsedActivityType) && parsedActivityType > 0 ? parsedActivityType : null,
+            reportable: false
+        }
+        offer.reportable = this.isOfferReportable(offer, today)
+        return offer
+    }
+
+    private mergeDashboardOffer(base: ParsedOffer, incoming: ParsedOffer, today: string): ParsedOffer {
+        const merged: ParsedOffer = {
+            offerId: base.offerId,
+            hash: base.hash ?? incoming.hash,
+            title: base.title || incoming.title,
+            description: base.description || incoming.description,
+            points: base.points || incoming.points,
+            promotionSubtype: base.promotionSubtype ?? incoming.promotionSubtype,
+            destination: base.destination || incoming.destination,
+            // 已完成/锁定只要有任一份说是，就按「已完成/锁定」处理，避免重复上报。
+            isCompleted: base.isCompleted || incoming.isCompleted,
+            isPromotional: base.isPromotional || incoming.isPromotional,
+            isLocked: base.isLocked || incoming.isLocked,
+            unlockCriteria: base.unlockCriteria ?? incoming.unlockCriteria,
+            date: base.date ?? incoming.date,
+            activityType: base.activityType ?? incoming.activityType,
+            reportable: false
+        }
+        merged.reportable = this.isOfferReportable(merged, today)
+        return merged
+    }
+
+    private buildDashboardOffers(data: DashboardData): ParsedOffer[] {
+        const today = this.todayStamp()
+        const collected = new Map<string, ParsedOffer>()
+        const dashboard = data.dashboard
+
+        const push = (promotion: unknown, date?: string | null): void => {
+            const offer = this.toParsedOffer(promotion, date ?? null, today)
+            if (!offer) return
+            const existing = collected.get(offer.offerId)
+            collected.set(offer.offerId, existing ? this.mergeDashboardOffer(existing, offer, today) : offer)
+        }
+
+        for (const [key, items] of Object.entries(dashboard.dailySetPromotions ?? {})) {
+            const day = this.normaliseDashboardDate(key)
+            for (const item of items ?? []) push(item, day)
+        }
+        for (const item of dashboard.morePromotions ?? []) push(item)
+        for (const item of dashboard.promotionalItems ?? []) push(item)
+        if (dashboard.promotionalItem) push(dashboard.promotionalItem)
+        for (const card of dashboard.punchCards ?? []) {
+            push(card.parentPromotion)
+            for (const child of card.childPromotions ?? []) push(child)
+        }
+
+        return [...collected.values()]
+    }
+
+    // 记录本轮拿到的仪表板：既是 flyout 挂掉时的回落源，也是 ensureOffer 的第三条数据源。
+    private rememberDashboard(data: DashboardData): void {
+        this.lastDashboard = data
+        const today = this.todayStamp()
+        let added = 0
+        for (const offer of this.buildDashboardOffers(data)) {
+            const existing = this.dashboardOfferIndex.get(offer.offerId)
+            this.dashboardOfferIndex.set(
+                offer.offerId,
+                existing ? this.mergeDashboardOffer(existing, offer, today) : offer
+            )
+            added++
+        }
+        this.bot.logger.debug(
+            this.bot.isMobile,
+            'DASHBOARD-INDEX',
+            `登记仪表板 offer | 本次=${added} | 索引累计=${this.dashboardOfferIndex.size} | 可上报=${[...this.dashboardOfferIndex.values()].filter(o => o.reportable).length}`
+        )
+    }
+
+    // 连缓存都没有时的最小降级仪表板：够 Main 跑完搜索与收尾，不会因为一个字段缺失炸整轮。
+    private buildDegradedDashboard(): DashboardData {
+        const availablePoints = this.bot.userData.currentPoints ?? 0
+        return {
+            dashboard: {
+                userStatus: { availablePoints, lifetimePoints: 0, counters: {} },
+                userWarnings: [],
+                userProfile: { attributes: {} },
+                dailySetPromotions: {},
+                morePromotions: [],
+                promotionalItems: [],
+                punchCards: []
+            },
+            profile: { attributes: {} }
+        } as unknown as DashboardData
+    }
+
+    // 给 Main / SearchProgress 用的永不抛版本：拿不到仪表板就用本轮缓存或最小降级对象。
+    async getDashboardDataSafe(cookies?: Cookie[]): Promise<DashboardData> {
+        try {
+            return await this.getDashboardData(cookies)
+        } catch (error) {
+            const cached = this.lastDashboard
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'GET-DASHBOARD-DATA',
+                `仪表板彻底不可用，使用${cached ? '本轮缓存的' : '降级'}仪表板继续运行 | 信息=${this.errorMessage(error)}`
+            )
+            return cached ?? this.buildDegradedDashboard()
+        }
     }
 
     async getAppDashboardData(channel = 'SAIOS'): Promise<AppDashboardData> {
@@ -218,12 +458,19 @@ export default class BrowserFunc {
                 totalEarnablePoints
             }
         } catch (error) {
-            this.bot.logger.error(
+            // 这一步只是「今天还能赚多少」的预估，拿不到就全 null，不该把整轮干掉。
+            this.bot.logger.warn(
                 this.bot.isMobile,
                 'GET-BROWSER-EARNABLE-POINTS',
-                `发生错误: ${error instanceof Error ? error.message : String(error)}`
+                `可赚积分预估失败，按未知处理（不影响实际跑任务）: ${error instanceof Error ? error.message : String(error)}`
             )
-            throw error
+            return {
+                dailySetPoints: 0,
+                morePromotionsPoints: 0,
+                desktopSearchPoints: null,
+                mobileSearchPoints: null,
+                totalEarnablePoints: null
+            }
         }
     }
 
@@ -278,18 +525,26 @@ export default class BrowserFunc {
         }
     }
 
+    // 云端实测：收尾这一步失败会把整轮判成 failure（哪怕积分已经加到账上）。
+    // 所以这里不再抛 —— 优先用缓存仪表板，最后退到本轮已累计的余额。
     async getCurrentPoints(): Promise<number> {
         try {
             const data = await this.getDashboardData()
 
-            return data.dashboard.userStatus.availablePoints
+            const points = data.dashboard.userStatus.availablePoints
+            if (Number.isFinite(points)) return Number(points)
+            throw new Error('availablePoints is not a finite number')
         } catch (error) {
-            this.bot.logger.error(
+            const fallback = this.lastDashboard?.dashboard.userStatus.availablePoints
+            const points = Number.isFinite(fallback) ? Number(fallback) : this.bot.userData.currentPoints ?? 0
+            this.bot.logger.warn(
                 this.bot.isMobile,
                 'GET-CURRENT-POINTS',
-                `发生错误: ${error instanceof Error ? error.message : String(error)}`
+                `取余额失败，改用${Number.isFinite(fallback) ? '缓存仪表板' : '本轮累计'}余额=${points} | 信息=${
+                    error instanceof Error ? error.message : String(error)
+                }`
             )
-            throw error
+            return points
         }
     }
 
@@ -1063,6 +1318,19 @@ export default class BrowserFunc {
             return fromSibling
         }
 
+        // 第三数据源：仪表板（主接口或 flyout）里登记过的 offer。
+        // 云端实测 /earn 与 /dashboard 的 HTML 都不含 Gamification_DailySet，但 flyout 的
+        // dailySetPromotions 是带 hash 的 —— 不查这份索引，DailySet 每天都会白白丢掉 3×10 分。
+        const fromDashboard = this.dashboardOfferIndex.get(offerId)
+        if (fromDashboard) {
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'EARN-SNAPSHOT',
+                `${offerId} 在 /earn 快照中缺失，改用仪表板登记的数据（hash=${fromDashboard.hash ? '有' : '无'} | 可上报=${fromDashboard.reportable} | date=${fromDashboard.date ?? '无'}）`
+            )
+            return fromDashboard
+        }
+
         this.bot.logger.debug(
             this.bot.isMobile,
             'EARN-SNAPSHOT',
@@ -1070,7 +1338,7 @@ export default class BrowserFunc {
         )
 
         const refreshed = await this.refreshEarnSnapshot()
-        if (!refreshed) return null
+        if (!refreshed) return this.dashboardOfferIndex.get(offerId) ?? null
 
         this.bot.reactSnapshot = this.bot.reactSnapshot ? this.mergeSnapshots(this.bot.reactSnapshot, refreshed) : refreshed
 
@@ -1082,6 +1350,6 @@ export default class BrowserFunc {
             `已重新获取 /earn 和 /dashboard | offers=${refreshed.offers.length}(合并后=${this.bot.reactSnapshot.offers.length}) | ${offerId} 找到=${!!live}`
         )
 
-        return live
+        return live ?? this.dashboardOfferIndex.get(offerId) ?? null
     }
 }
