@@ -436,3 +436,54 @@ schedule:
 gh workflow run rewards-daily -f force=true     # 忽略时间窗和今日标记
 node scripts/ci/ensure-daily-run.mjs --force    # 本机调度器强制
 ```
+
+## 「fork 仓库 Actions 被禁用」（2026-11-20 实际踩到）
+
+### 现象
+
+Gitee 兜底构建突然全红，日志里：
+
+```
+[rewards-daily] 触发失败：HTTP 422 /repos/LAIXINQUAN/Microsoft-Rewards-Script/actions/workflows/420202401/dispatches
+  -> {"message":"Actions has been disabled for this repository."}
+The task build Failure! / exit status 255
+```
+
+同一批 kgcheckin 却照常（`skip (run cache:kg-done-...)`），只有 rewards 这个仓库死。
+
+### 为什么 API 查不出来
+
+`gh api repos/LAIXINQUAN/Microsoft-Rewards-Script/actions/permissions` 返回：
+
+```json
+{"enabled":true,"allowed_actions":"all","sha_pinning_required":false}
+```
+
+**这个开关是开的**，`PUT .../actions/permissions -F enabled=true` 也返回 200，但一点用都没有。
+仓库 `disabled:false / archived:false / fork:true / private:false`，上游 chiihero 那头也正常。
+账号本身没问题（建了个探针仓库 dispatch 秒跑通），kgcheckin 也是 fork 但 Actions 正常。
+
+真正原因在网页上：打开 `https://github.com/<owner>/<repo>/actions` 会看到
+
+> **Workflows on this fork have been disabled**
+> GitHub disabled workflows on this forked repository to reduce the amount of compute that is wasted.
+
+这是 GitHub 针对 **fork 仓库** 的独立闸门（防止你拿别人的 workflow 白嫖算力），
+和 Settings → Actions 的 enabled 字段不是一回事，**REST API 改不动，只能网页点一次**。
+
+### 修法（一次性，30 秒）
+
+1. 浏览器打开 `https://github.com/<owner>/<repo>/actions`
+2. 点绿色按钮 **"I understand my workflows, go ahead and re-enable them"**
+3. 顶部出现蓝色横幅 **"Actions Enabled."** 即成功，之前 queued 的 run 会立刻开始处理
+
+### 已加的自检
+
+`scripts/ci/dispatch-gitee.cjs` 现在会在触发前先 GET 一次 `/actions/workflows?per_page=1` 做预检，
+并在收到 422 `Actions has been disabled` 时把上面三步修复说明直接打进构建日志（不用再回来翻文档）。
+Gitee 侧同步推送。
+
+### 什么时候会再犯
+
+fork 之后**长时间没有手动登录 Actions**、或者 GitHub 判定这个 fork 的 workflow 很少跑时，会再次预置成禁用。
+自愈不了的部分是：这里必须点一次网页。想彻底避免 → 不用 fork，把代码搬进自己的**新建**仓库（非 fork）。
