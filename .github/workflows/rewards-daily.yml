@@ -180,9 +180,14 @@ jobs:
         timeout-minutes: 70
         env:
           TZ: Asia/Shanghai
-          DEBUG_MODE: ${{ github.event.inputs.debug }}
+          # 注意：代码里没有 DEBUG_MODE 这个变量（早先写的是死变量，云端一条 debug 都没输出过）。
+          # 真正控制 debug 的是 config.debugLogs，走 CONFIG_* 环境覆盖（src/util/ConfigEnvOverrides.ts:15）。
+          CONFIG_DEBUG_LOGS: ${{ github.event.inputs.debug || 'false' }}
         run: |
           set -o pipefail
+          # CONFIG_* 不会被主程序自动套用，必须先显式 apply 一次才会写回 config.json
+          node dist/util/ConfigEnvOverrides.js apply --config config.json
+          grep -o '"debugLogs": *[a-z]*' config.json || true
           npm start 2>&1 | tee rewards-run.log
 
       - name: 发送积分邮件
