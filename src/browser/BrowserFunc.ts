@@ -93,7 +93,10 @@ export default class BrowserFunc {
                 headers: {
                     ...fingerprintHeaders,
                     Accept: 'application/json',
-                    Cookie: this.buildCookieHeader(this.getCachedCookies(cookies, URLs.bing.rewardsFlyoutUserInfo)),
+                    // flyout 必须带完整登录 jar 才有真实数据：实测（2026-11-20）只发 bing 域 cookie
+                    // 时 flyout 返回空壳（availablePoints=0、dailySetPromotions 为空），带上 .live.com 的
+                    // MSPAuth/MSPProf/WLSSC 等认证 cookie 才返回真实余额与每日任务列表。
+                    Cookie: this.buildCookieHeader(this.getFullCookieJar(cookies)),
                     Referer: `${URLs.bing.origin}/`,
                     Origin: URLs.bing.origin
                 },
@@ -313,6 +316,17 @@ export default class BrowserFunc {
             this.bot.reactSnapshot = snapshot
             if (this.bot.isMobile) this.bot.reactSnapshots.mobile = snapshot
             else this.bot.reactSnapshots.desktop = snapshot
+
+            // 诊断：区分「HTML 里本来就没有」和「解析器丢了」——云端 DailySet 丢失时靠这行定位
+            const dailySetProbe = /Gamification_DailySet/i
+            this.bot.logger.info(
+                this.bot.isMobile,
+                'BOOTSTRAP',
+                `快照诊断 | /earn-http=${earnRaw.length}B(DailySet=${dailySetProbe.test(earnRaw)}) | /earn-dom=${earnDom.length}B(DailySet=${dailySetProbe.test(earnDom)}) | /dashboard-http=${dashboardHtml.length}B(DailySet=${dailySetProbe.test(dashboardHtml)}) | offers=${snapshot.offers.length} | 样本=${snapshot.offers
+                    .slice(0, 6)
+                    .map(o => o.offerId)
+                    .join(',')}`
+            )
 
             // discovered from chunks referenced by either page
             this.bot.nextActions = await this.resolveActionIds(page, sources)
@@ -617,6 +631,14 @@ export default class BrowserFunc {
     private getCachedCookies(explicitCookies?: Cookie[], targetUrl?: string): Cookie[] {
         const cookies = explicitCookies ?? (this.bot.isMobile ? this.bot.cookies.mobile : this.bot.cookies.desktop)
         return targetUrl ? this.filterCookiesForUrl(cookies, targetUrl) : cookies
+    }
+
+    // 整包 cookie（不按域名过滤，只剔除已过期的）。仅给 Bing flyout 用：
+    // 它的 SSO 侧认 .live.com 的认证 cookie，而这些域名正常情况下不会随 bing.com 请求发出。
+    private getFullCookieJar(explicitCookies?: Cookie[]): Cookie[] {
+        const cookies = explicitCookies ?? (this.bot.isMobile ? this.bot.cookies.mobile : this.bot.cookies.desktop)
+        const now = Date.now() / 1000
+        return cookies.filter(cookie => cookie.expires === -1 || cookie.expires > now)
     }
 
     async checkpointActiveSession(source = 'SESSION-CHECKPOINT'): Promise<boolean> {
@@ -997,9 +1019,49 @@ export default class BrowserFunc {
         }
     }
 
+    // 合并两份快照：同 offerId 保留已存在的那条（旧快照里的 hash 同样有效），只补齐新出现的 offer。
+    // 云端实测踩过的坑：重抓的快照 offer 数量与 bootstrap 相同但内容不同（缺 DailySet），
+    // 早先按「数量 >= 就整份覆盖」的写法会把 bootstrap 里能上报的 offer 顶掉。
+    private mergeSnapshots(base: PageSnapshot, incoming: PageSnapshot): PageSnapshot {
+        const offers = [...base.offers]
+        const seen = new Set(offers.map(o => o.offerId))
+        for (const offer of incoming.offers) {
+            if (seen.has(offer.offerId)) continue
+            offers.push(offer)
+            seen.add(offer.offerId)
+        }
+
+        return {
+            offers,
+            reportable: offers.filter(o => o.reportable),
+            streaks: base.streaks.length ? base.streaks : incoming.streaks,
+            streakProtection: base.streakProtection ?? incoming.streakProtection,
+            account: {
+                level: base.account.level ?? incoming.account.level,
+                pointsProgress: base.account.pointsProgress ?? incoming.account.pointsProgress,
+                pointsRemaining: base.account.pointsRemaining ?? incoming.account.pointsRemaining,
+                lifetimeEarn: base.account.lifetimeEarn ?? incoming.account.lifetimeEarn,
+                availablePoints: base.account.availablePoints ?? incoming.account.availablePoints
+            }
+        }
+    }
+
     async ensureOffer(offerId: string): Promise<ParsedOffer | null> {
         const cached = this.bot.reactSnapshot?.offers.find(o => o.offerId === offerId)
         if (cached) return cached
+
+        // 跨平台兜底：mobile 阶段跑完后 mainMobilePage 已关，desktop 阶段会重新 bootstrap 并把
+        // reactSnapshot 换成 desktop 的那份。offerId 在两个平台是同一个，所以另一平台的快照同样可用。
+        const sibling = this.bot.isMobile ? this.bot.reactSnapshots.desktop : this.bot.reactSnapshots.mobile
+        const fromSibling = sibling?.offers.find(o => o.offerId === offerId)
+        if (fromSibling) {
+            this.bot.logger.debug(
+                this.bot.isMobile,
+                'EARN-SNAPSHOT',
+                `${offerId} 不在当前快照中，改用 ${this.bot.isMobile ? 'desktop' : 'mobile'} 阶段的快照命中（hash=${fromSibling.hash ? '有' : '无'}）`
+            )
+            return fromSibling
+        }
 
         this.bot.logger.debug(
             this.bot.isMobile,
@@ -1010,16 +1072,14 @@ export default class BrowserFunc {
         const refreshed = await this.refreshEarnSnapshot()
         if (!refreshed) return null
 
-        if (!this.bot.reactSnapshot || refreshed.offers.length >= this.bot.reactSnapshot.offers.length) {
-            this.bot.reactSnapshot = refreshed
-        }
+        this.bot.reactSnapshot = this.bot.reactSnapshot ? this.mergeSnapshots(this.bot.reactSnapshot, refreshed) : refreshed
 
-        const live = refreshed.offers.find(o => o.offerId === offerId) ?? null
+        const live = this.bot.reactSnapshot.offers.find(o => o.offerId === offerId) ?? null
 
         this.bot.logger.debug(
             this.bot.isMobile,
             'EARN-SNAPSHOT',
-            `已重新获取 /earn 和 /dashboard | offers=${refreshed.offers.length} | ${offerId} 找到=${!!live}`
+            `已重新获取 /earn 和 /dashboard | offers=${refreshed.offers.length}(合并后=${this.bot.reactSnapshot.offers.length}) | ${offerId} 找到=${!!live}`
         )
 
         return live
